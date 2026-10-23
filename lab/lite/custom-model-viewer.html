@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Babylon Lite — Custom Model Viewer</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { width: 100%; height: 100%; display: block; }
+
+    #drop-zone {
+      position: fixed; top: 1rem; left: 50%; transform: translateX(-50%);
+      z-index: 10; width: min(90vw, 480px);
+      padding: 1rem 1.25rem; border-radius: 10px;
+      background: rgba(13, 17, 23, 0.85); border: 1px dashed #30363d;
+      color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      text-align: center; cursor: pointer; transition: border-color 0.15s, background 0.15s;
+    }
+    #drop-zone.drag-over { border-color: #58a6ff; background: rgba(13, 17, 23, 0.95); }
+    #drop-zone.hidden { opacity: 0.6; }
+    #drop-zone h2 { font-size: 0.95rem; margin: 0 0 0.35rem; }
+    #status { font-size: 0.8rem; color: #8b949e; }
+
+    #layers-panel {
+      position: fixed; top: 1rem; right: 1rem; z-index: 10;
+      width: 220px; max-height: 70vh; overflow-y: auto;
+      padding: 0.75rem 0.9rem; border-radius: 10px;
+      background: rgba(13, 17, 23, 0.85); border: 1px solid #30363d;
+      color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #layers-panel.hidden { display: none; }
+    #layers-panel h3 { font-size: 0.85rem; margin: 0; color: #8b949e; font-weight: 600; }
+    .layers-panel-header {
+      display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;
+    }
+    #show-all-button {
+      font-size: 0.7rem; padding: 0.15rem 0.5rem; background: #1f6feb; color: #fff;
+      border: none; border-radius: 4px; cursor: pointer;
+    }
+    #show-all-button.hidden { display: none; }
+    #show-all-button:hover { background: #388bfd; }
+    .layer-row {
+      display: flex; flex-direction: column; gap: 0.1rem;
+      padding: 0.2rem 0; font-size: 0.8rem;
+    }
+    .layer-row-isolated { background: rgba(31, 111, 235, 0.15); border-radius: 4px; }
+    .layer-row-selected { background: rgba(63, 185, 80, 0.2); border-radius: 4px; outline: 1px solid #3fb950; }
+    .layer-row-main { display: flex; align-items: center; gap: 0.5rem; }
+    .layer-color {
+      flex-shrink: 0; width: 1.1rem; height: 1.1rem; padding: 0;
+      border: 1px solid #30363d; border-radius: 4px; background: none; cursor: pointer;
+    }
+    .layer-color::-webkit-color-swatch-wrapper { padding: 0; }
+    .layer-color::-webkit-color-swatch { border: none; border-radius: 3px; }
+    .layer-name {
+      flex: 1; min-width: 0;
+      background: transparent; border: 1px solid transparent; border-radius: 4px;
+      color: #e6edf3; font: inherit; padding: 0.1rem 0.3rem;
+      text-overflow: ellipsis;
+    }
+    .layer-name:hover { border-color: #30363d; }
+    .layer-name:focus { outline: none; border-color: #58a6ff; background: rgba(88, 166, 255, 0.08); }
+    .layer-dup-badge { font-size: 0.65rem; color: #8b949e; flex-shrink: 0; }
+    .layer-locate {
+      flex-shrink: 0; width: 1.4rem; height: 1.4rem; padding: 0;
+      background: transparent; border: 1px solid transparent; border-radius: 4px;
+      color: #8b949e; font-size: 0.8rem; line-height: 1; cursor: pointer;
+    }
+    .layer-locate:hover { border-color: #30363d; color: #58a6ff; }
+    .layer-locate.active { color: #58a6ff; border-color: #1f6feb; }
+    .layer-delete {
+      flex-shrink: 0; width: 1.4rem; height: 1.4rem; padding: 0;
+      background: transparent; border: 1px solid transparent; border-radius: 4px;
+      color: #8b949e; font-size: 0.8rem; line-height: 1; cursor: pointer;
+    }
+    .layer-delete:hover { border-color: #30363d; color: #f85149; }
+    .layer-row-deleted { opacity: 0.45; }
+    .layer-row-deleted .layer-delete { color: #58a6ff; }
+    .layer-row-deleted .layer-delete:hover { border-color: #30363d; color: #58a6ff; }
+    .layer-row-deleted .layer-name { text-decoration: line-through; }
+    .layer-opacity-row {
+      display: flex; align-items: center; gap: 0.4rem;
+      padding-left: 1.4rem; /* lines up under the name, past the checkbox */
+    }
+    .layer-opacity { flex: 1; accent-color: #58a6ff; height: 0.9rem; }
+    .layer-opacity-value {
+      font-size: 0.65rem; color: #8b949e; flex-shrink: 0; width: 2.2rem; text-align: right;
+    }
+
+    #export-button {
+      width: 100%; margin-top: 0.6rem; padding: 0.4rem 0.6rem;
+      background: #238636; border: none; border-radius: 6px;
+      color: #fff; font-size: 0.8rem; font-weight: 600; cursor: pointer;
+    }
+    #export-button:hover:not(:disabled) { background: #2ea043; }
+    #export-button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+
+    #annotations-panel {
+      position: fixed; bottom: 1rem; right: 1rem; z-index: 10;
+      width: 260px; max-height: 40vh; overflow-y: auto;
+      padding: 0.75rem 0.9rem; border-radius: 10px;
+      background: rgba(13, 17, 23, 0.85); border: 1px solid #30363d;
+      color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #annotations-panel.hidden { display: none; }
+    #annotations-panel h3 { font-size: 0.85rem; margin: 0 0 0.5rem; color: #8b949e; font-weight: 600; }
+    #annotation-place-button {
+      width: 100%; margin-bottom: 0.6rem; padding: 0.4rem 0.6rem;
+      background: #1f6feb; border: none; border-radius: 6px;
+      color: #fff; font-size: 0.8rem; font-weight: 600; cursor: pointer;
+    }
+    #annotation-place-button.active { background: #9e6a03; }
+    .annotation-empty { font-size: 0.75rem; color: #8b949e; font-style: italic; }
+    .annotation-row {
+      padding: 0.3rem 0; border-top: 1px solid #30363d; font-size: 0.78rem; cursor: pointer;
+      display: flex; align-items: flex-start; gap: 0.4rem;
+    }
+    .annotation-row:first-child { border-top: none; }
+    .annotation-row-swatch {
+      flex-shrink: 0; width: 10px; height: 10px; border-radius: 50%;
+      margin-top: 0.25rem; border: 1px solid rgba(255, 255, 255, 0.4);
+    }
+    .annotation-row-text { overflow-wrap: anywhere; }
+    .annotation-row-ref {
+      display: block; margin-top: 0.15rem; font-size: 0.68rem; color: #58a6ff;
+    }
+
+    /* Pin markers: positioned by JS in cssX/cssY coordinates relative to this layer. */
+    #annotation-pins {
+      position: fixed; inset: 0; z-index: 9; pointer-events: none;
+    }
+    .annotation-pin {
+      position: absolute; transform: translate(-50%, -50%);
+      width: 10px; height: 10px; border-radius: 50%;
+      border: 1.5px solid #fff;
+      cursor: pointer; pointer-events: auto; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+    }
+
+    .annotation-form {
+      position: fixed; z-index: 20; width: 260px;
+      padding: 0.6rem 0.7rem; border-radius: 8px;
+      background: #0d1117; border: 1px solid #30363d;
+      color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex; flex-direction: column; gap: 0.3rem; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+      max-height: 80vh; overflow-y: auto;
+    }
+    .annotation-form label { font-size: 0.7rem; color: #8b949e; }
+    .annotation-form textarea,
+    .annotation-form input[type="text"] {
+      background: #161b22; border: 1px solid #30363d; border-radius: 4px;
+      color: #e6edf3; font: inherit; font-size: 0.78rem; padding: 0.25rem 0.4rem; resize: vertical;
+    }
+    .annotation-color-input {
+      width: 100%; height: 28px; padding: 2px; border: 1px solid #30363d; border-radius: 4px;
+      background: #161b22; cursor: pointer;
+    }
+    .annotation-form-buttons { display: flex; gap: 0.4rem; margin-top: 0.2rem; }
+    .annotation-form-buttons button {
+      flex: 1; padding: 0.3rem 0.4rem; border: none; border-radius: 5px;
+      background: #238636; color: #fff; font-size: 0.75rem; font-weight: 600; cursor: pointer;
+    }
+    .annotation-form-buttons button.secondary { background: #30363d; }
+    .annotation-form-buttons button.danger { background: #da3633; }
+    .annotation-sheets-section {
+      display: flex; flex-direction: column; gap: 0.3rem;
+      border-top: 1px solid #30363d; border-bottom: 1px solid #30363d;
+      padding: 0.4rem 0;
+    }
+    .annotation-sheets-status { font-size: 0.7rem; color: #8b949e; min-height: 1em; }
+    .annotation-row-data { font-size: 0.72rem; max-height: 140px; overflow-y: auto; }
+    .annotation-row-data-line { padding: 0.1rem 0; word-break: break-word; }
+
+    #sheets-panel {
+      position: fixed; top: 1rem; right: 1rem; z-index: 15; width: 240px;
+      padding: 0.7rem 0.8rem; border-radius: 8px;
+      background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex; flex-direction: column; gap: 0.35rem;
+    }
+    #sheets-panel.hidden { display: none; }
+    #sheets-panel h3 { margin: 0 0 0.2rem; font-size: 0.85rem; }
+    #sheets-panel-header { display: flex; align-items: center; justify-content: space-between; }
+    #sheets-panel-header h3 { margin: 0; }
+    #sheets-close-button {
+      background: none; border: none; color: #8b949e; font-size: 1.1rem; line-height: 1;
+      cursor: pointer; padding: 0 0.2rem;
+    }
+    #sheets-close-button:hover { color: #e6edf3; }
+    #sheets-reopen-button.hidden { display: none; }
+    #sheets-reopen-button {
+      position: fixed; top: 1rem; right: 1rem; z-index: 15;
+      padding: 0.35rem 0.6rem; border: 1px solid #30363d; border-radius: 6px;
+      background: #0d1117; color: #e6edf3; font-size: 0.78rem; cursor: pointer;
+    }
+    #sheets-panel label { font-size: 0.7rem; color: #8b949e; }
+    #sheets-panel input {
+      background: #161b22; border: 1px solid #30363d; border-radius: 4px;
+      color: #e6edf3; font: inherit; font-size: 0.76rem; padding: 0.25rem 0.4rem; width: 100%; box-sizing: border-box;
+    }
+    #sheets-connect-button {
+      margin-top: 0.2rem; padding: 0.35rem; border: none; border-radius: 5px;
+      background: #238636; color: #fff; font-size: 0.78rem; font-weight: 600; cursor: pointer;
+    }
+    #sheets-status { font-size: 0.7rem; color: #8b949e; }
+  </style>
+</head>
+<body>
+  <canvas id="renderCanvas"></canvas>
+  <div id="drop-zone">
+    <h2>Custom Model Viewer</h2>
+    <div id="status">Drop a .glb/.gltf file here, or click to browse.</div>
+    <input id="file-input" type="file" accept=".glb,.gltf" style="display:none" />
+  </div>
+  <div id="layers-panel" class="hidden">
+    <div class="layers-panel-header">
+      <h3>Layers</h3>
+      <button id="show-all-button" class="hidden" title="Exit isolation — restore every mesh's own visibility toggle">Show All</button>
+    </div>
+    <div id="layers-list"></div>
+    <button id="export-button" disabled title="Download the model with renamed layers and annotations baked in">Export Renamed Model</button>
+  </div>
+  <div id="annotations-panel" class="hidden">
+    <h3>Annotations</h3>
+    <button id="annotation-place-button">📍 Add Annotation</button>
+    <div id="annotations-list"></div>
+  </div>
+  <div id="annotation-pins"></div>
+  <button id="sheets-reopen-button" class="hidden" title="Open Google Sheet settings">🔗 Sheet</button>
+  <div id="sheets-panel" class="hidden">
+    <div id="sheets-panel-header">
+      <h3>Google Sheet</h3>
+      <button id="sheets-close-button" title="Close">×</button>
+    </div>
+    <label for="sheets-client-id">OAuth Client ID</label>
+    <input id="sheets-client-id" type="text" placeholder="xxxx.apps.googleusercontent.com" />
+    <label for="sheets-spreadsheet-id">Spreadsheet ID</label>
+    <input id="sheets-spreadsheet-id" type="text" placeholder="Spreadsheet ID from the sheet URL" />
+    <label for="sheets-tab-name">Tab name</label>
+    <input id="sheets-tab-name" type="text" placeholder="e.g. EveryPoint" />
+    <button id="sheets-connect-button">Connect to Google Sheets</button>
+    <div id="sheets-status">Not connected.</div>
+  </div>
+  <script src="/loader.js"></script>
+  <script type="module" src="/lite/src/lite/custom-model-viewer.ts"></script>
+</body>
+</html>
+
