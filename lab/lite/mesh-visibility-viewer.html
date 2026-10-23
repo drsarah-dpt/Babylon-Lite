@@ -33,6 +33,10 @@
       background: rgba(13, 17, 23, 0.85); border: 1px solid #30363d;
       color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
+    /* Panel A's model sits on the left half of the screen, so its layer list is
+       pinned to the OUTER (far-left) edge instead of overlapping the model/center
+       divider. Panel B keeps the default right-side placement (its outer edge). */
+    .layers-panel.layers-panel-left { right: auto; left: 1rem; }
     .layers-panel.hidden { display: none; }
     .layers-panel h3 { font-size: 0.85rem; margin: 0 0 0.5rem; color: #8b949e; font-weight: 600; }
     .layer-row {
@@ -52,7 +56,7 @@
         <div class="status" id="status-a">Drop a .glb/.gltf file here, or click to browse.</div>
         <input class="file-input" id="file-input-a" type="file" accept=".glb,.gltf" style="display:none" />
       </div>
-      <div class="layers-panel hidden" id="layers-panel-a">
+      <div class="layers-panel layers-panel-left hidden" id="layers-panel-a">
         <h3>Layers</h3>
         <div id="layers-list-a"></div>
       </div>
