@@ -46,6 +46,7 @@ import {
 } from "./gltf-container-io.js";
 import { createAnnotationOverlay, parseStoredAnnotations } from "./annotation-overlay.js";
 import { loadSheetsConfig, saveSheetsConfig, connect as connectSheets, isConnected as isSheetsConnected } from "./google-sheets.js";
+import { mergeGltfContainers } from "./merge-gltf.js";
 
 const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
 const dropZone = document.getElementById("drop-zone")!;
@@ -55,6 +56,8 @@ const layersPanel = document.getElementById("layers-panel")!;
 const layersList = document.getElementById("layers-list")!;
 const showAllButton = document.getElementById("show-all-button") as HTMLButtonElement;
 const exportButton = document.getElementById("export-button") as HTMLButtonElement;
+const mergeButton = document.getElementById("merge-button") as HTMLButtonElement;
+const mergeFileInput = document.getElementById("merge-file-input") as HTMLInputElement;
 const annotationsPanel = document.getElementById("annotations-panel")!;
 const annotationsList = document.getElementById("annotations-list")!;
 const annotationPinLayer = document.getElementById("annotation-pins")!;
@@ -540,53 +543,94 @@ exportButton.addEventListener("click", exportModel);
  *  which permanently blocks WebGPU with "context not available". */
 const enginePromise: Promise<EngineContext> = createEngine(canvas);
 
+/** Core load path shared by "replace model" and "merge in another model": takes raw
+ *  file bytes that have already been decided on (a plain loaded file, or the
+ *  re-serialized result of a merge), parses them, and rebuilds the whole scene +
+ *  Layers panel from scratch. `displayName` is only used for status messages and as
+ *  the export file name. */
+async function loadModelFromBuffer(data: ArrayBuffer, displayName: string): Promise<void> {
+    const parsed = parseGltfContainer(data);
+    loadedContainer = parsed;
+    originalFileName = displayName;
+    exportMaterialClones = new Map();
+    deletedPrimitiveKeys = new Set();
+    exportButton.disabled = false;
+    mergeButton.disabled = false;
+
+    if (!engine) {
+        engine = await enginePromise;
+    } else {
+        stopEngine(engine);
+    }
+    if (activeScene) {
+        unregisterScene(activeScene);
+        disposeScene(activeScene);
+        activeScene = null;
+    }
+
+    const scene = createSceneContext(engine);
+    const container = await loadGltf(engine, data);
+    addToScene(scene, container);
+    addToScene(scene, createHemisphericLight());
+
+    const cam = createDefaultCamera(scene);
+    attachControl(cam, canvas, scene);
+    activeCamera = cam;
+
+    await registerScene(scene);
+    await startEngine(engine);
+    activeScene = scene;
+
+    const meshRefs = collectMeshIndicesInContainerOrder(parsed.json);
+    buildLayersPanel(getContainerMeshes(container), meshRefs);
+
+    annotationOverlay.setAnnotations(parseStoredAnnotations(parsed.json.extras?.[ANNOTATIONS_EXTRAS_KEY]));
+    annotationsPanel.classList.remove("hidden");
+
+    Object.assign(canvas.dataset, { ready: true });
+    dropZone.classList.add("hidden");
+    setStatus(`Loaded "${displayName}". Drop another file to replace it.`);
+    dropZone.classList.remove("hidden");
+}
+
 async function loadModel(file: File): Promise<void> {
     setStatus(`Loading "${file.name}"…`);
     try {
         const data = await file.arrayBuffer();
-        const parsed = parseGltfContainer(data);
-        loadedContainer = parsed;
-        originalFileName = file.name;
-        exportMaterialClones = new Map();
-        deletedPrimitiveKeys = new Set();
-        exportButton.disabled = false;
-
-        if (!engine) {
-            engine = await enginePromise;
-        } else {
-            stopEngine(engine);
-        }
-        if (activeScene) {
-            unregisterScene(activeScene);
-            disposeScene(activeScene);
-            activeScene = null;
-        }
-
-        const scene = createSceneContext(engine);
-        const container = await loadGltf(engine, data);
-        addToScene(scene, container);
-        addToScene(scene, createHemisphericLight());
-
-        const cam = createDefaultCamera(scene);
-        attachControl(cam, canvas, scene);
-        activeCamera = cam;
-
-        await registerScene(scene);
-        await startEngine(engine);
-        activeScene = scene;
-
-        const meshRefs = collectMeshIndicesInContainerOrder(parsed.json);
-        buildLayersPanel(getContainerMeshes(container), meshRefs);
-
-        annotationOverlay.setAnnotations(parseStoredAnnotations(parsed.json.extras?.[ANNOTATIONS_EXTRAS_KEY]));
-        annotationsPanel.classList.remove("hidden");
-
-        Object.assign(canvas.dataset, { ready: true });
-        dropZone.classList.add("hidden");
-        setStatus(`Loaded "${file.name}". Drop another file to replace it.`);
-        dropZone.classList.remove("hidden");
+        await loadModelFromBuffer(data, file.name);
     } catch (err) {
         setStatus(`Failed to load "${file.name}": ${(err as Error).message}`, true);
+        console.error(err);
+    }
+}
+
+/** Merge a newly-picked file into the currently loaded model, producing one combined
+ *  model with a single unified mesh list (every mesh from either file gets its own
+ *  on/off toggle in the Layers panel, and Export produces one combined .glb). Pending
+ *  deletions/renames/opacity/color edits already made on the current model are baked
+ *  into its JSON first (the same "apply deletions before serializing" step used by
+ *  exportModel), so they aren't lost in the merge. */
+async function mergeModel(file: File): Promise<void> {
+    if (!loadedContainer) {
+        setStatus("Load a model first, then use \"Merge in another model\" to combine a second one in.", true);
+        return;
+    }
+    setStatus(`Merging in "${file.name}"…`);
+    try {
+        applyPrimitiveDeletions(loadedContainer.json, deletedPrimitiveKeys);
+        deletedPrimitiveKeys = new Set();
+
+        const data = await file.arrayBuffer();
+        const parsedB = parseGltfContainer(data);
+        const merged = mergeGltfContainers(loadedContainer, parsedB, originalFileName, file.name);
+        const blob = serializeGlb(merged.json, merged.binChunk ?? new Uint8Array(0));
+        const mergedBuffer = await blob.arrayBuffer();
+
+        const baseA = originalFileName.replace(/\.(glb|gltf)$/i, "");
+        const baseB = file.name.replace(/\.(glb|gltf)$/i, "");
+        await loadModelFromBuffer(mergedBuffer, `${baseA}+${baseB}-merged.glb`);
+    } catch (err) {
+        setStatus(`Failed to merge "${file.name}": ${(err as Error).message}`, true);
         console.error(err);
     }
 }
@@ -616,6 +660,15 @@ fileInput.addEventListener("change", () => {
     if (file) {
         void loadModel(file);
     }
+});
+
+mergeButton.addEventListener("click", () => mergeFileInput.click());
+mergeFileInput.addEventListener("change", () => {
+    const file = mergeFileInput.files?.[0];
+    if (file) {
+        void mergeModel(file);
+    }
+    mergeFileInput.value = "";
 });
 
 // Mark the loader overlay ready immediately — there is no model to wait for until the user picks one.

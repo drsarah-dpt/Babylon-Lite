@@ -94,6 +94,14 @@
     #export-button:hover:not(:disabled) { background: #2ea043; }
     #export-button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
 
+    #merge-button {
+      width: 100%; margin-top: 0.4rem; padding: 0.4rem 0.6rem;
+      background: #1f6feb; border: none; border-radius: 6px;
+      color: #fff; font-size: 0.8rem; font-weight: 600; cursor: pointer;
+    }
+    #merge-button:hover:not(:disabled) { background: #388bfd; }
+    #merge-button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+
     #annotations-panel {
       position: fixed; bottom: 1rem; right: 1rem; z-index: 10;
       width: 260px; max-height: 40vh; overflow-y: auto;
@@ -216,6 +224,8 @@
       <button id="show-all-button" class="hidden" title="Exit isolation — restore every mesh's own visibility toggle">Show All</button>
     </div>
     <div id="layers-list"></div>
+    <button id="merge-button" disabled title="Combine another .glb/.gltf file into this model as one exportable model">+ Merge In Another Model</button>
+    <input id="merge-file-input" type="file" accept=".glb,.gltf" style="display:none" />
     <button id="export-button" disabled title="Download the model with renamed layers and annotations baked in">Export Renamed Model</button>
   </div>
   <div id="annotations-panel" class="hidden">
