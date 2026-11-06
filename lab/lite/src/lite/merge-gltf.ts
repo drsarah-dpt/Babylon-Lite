@@ -277,3 +277,440 @@ export function mergeGltfContainers(a: ParsedGltfContainer, b: ParsedGltfContain
 
     return { json: mergedJson, binChunk: combinedBin, isBinary: true };
 }
+
+/** One entry per mesh definition in a file, for a "pick which meshes to bring in"
+ *  selection UI. `instanceCount` is how many nodes in the file's default scene place
+ *  this mesh (almost always 1) — meshes with 0 instances aren't reachable from the
+ *  scene root and are omitted, since there'd be nothing to extract a world transform for. */
+export interface SelectableMeshEntry {
+    meshIndex: number;
+    name: string;
+    instanceCount: number;
+}
+
+/** List every mesh in `container` that's actually placed somewhere in its default scene,
+ *  for a mesh-selection checklist (e.g. "only bring in the two organ meshes, not the
+ *  whole duplicate skeleton/muscle set"). */
+export function listSelectableMeshes(container: ParsedGltfContainer): SelectableMeshEntry[] {
+    const json = container.json;
+    const nodes: any[] = json.nodes ?? [];
+    const meshes: any[] = json.meshes ?? [];
+    const instanceCounts = new Map<number, number>();
+    const roots: number[] = json.scenes?.[json.scene ?? 0]?.nodes ?? [];
+    const visited = new Set<number>();
+    const visit = (nodeIndex: number): void => {
+        if (visited.has(nodeIndex)) {
+            return;
+        }
+        visited.add(nodeIndex);
+        const node = nodes[nodeIndex];
+        if (!node) {
+            return;
+        }
+        if (node.mesh !== undefined) {
+            instanceCounts.set(node.mesh, (instanceCounts.get(node.mesh) ?? 0) + 1);
+        }
+        for (const child of node.children ?? []) {
+            visit(child);
+        }
+    };
+    for (const root of roots) {
+        visit(root);
+    }
+    const entries: SelectableMeshEntry[] = [];
+    meshes.forEach((mesh, meshIndex) => {
+        const instanceCount = instanceCounts.get(meshIndex) ?? 0;
+        if (instanceCount > 0) {
+            entries.push({ meshIndex, name: mesh.name || `mesh ${meshIndex}`, instanceCount });
+        }
+    });
+    return entries;
+}
+
+/** Identity 4x4 (column-major, matching glTF's node.matrix convention). */
+function mat4Identity(): number[] {
+    return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+}
+
+/** Compose a node's local matrix from its TRS properties (or identity defaults), using the
+ *  exact formula the glTF spec defines for node.translation/rotation/scale -> matrix. */
+function mat4FromTRS(node: any): number[] {
+    const [tx, ty, tz] = node.translation ?? [0, 0, 0];
+    const [qx, qy, qz, qw] = node.rotation ?? [0, 0, 0, 1];
+    const [sx, sy, sz] = node.scale ?? [1, 1, 1];
+    return [
+        (1 - 2 * qy * qy - 2 * qz * qz) * sx,
+        (2 * qx * qy + 2 * qz * qw) * sx,
+        (2 * qx * qz - 2 * qy * qw) * sx,
+        0,
+        (2 * qx * qy - 2 * qz * qw) * sy,
+        (1 - 2 * qx * qx - 2 * qz * qz) * sy,
+        (2 * qy * qz + 2 * qx * qw) * sy,
+        0,
+        (2 * qx * qz + 2 * qy * qw) * sz,
+        (2 * qy * qz - 2 * qx * qw) * sz,
+        (1 - 2 * qx * qx - 2 * qy * qy) * sz,
+        0,
+        tx,
+        ty,
+        tz,
+        1,
+    ];
+}
+
+/** Column-major 4x4 matrix multiply: returns a*b (b applied first, then a) — the standard
+ *  "world = parentWorld * localMatrix" composition used to walk a glTF node hierarchy. */
+function mat4Multiply(a: number[], b: number[]): number[] {
+    const out = new Array(16).fill(0);
+    for (let col = 0; col < 4; col++) {
+        for (let row = 0; row < 4; row++) {
+            let sum = 0;
+            for (let k = 0; k < 4; k++) {
+                sum += (a[k * 4 + row] ?? 0) * (b[col * 4 + k] ?? 0);
+            }
+            out[col * 4 + row] = sum;
+        }
+    }
+    return out;
+}
+
+/** World matrix (column-major 16-number array) for every node reachable from `json`'s
+ *  default scene, computed by walking the hierarchy from each root with an identity
+ *  parent transform. */
+function computeWorldMatrices(json: any): Map<number, number[]> {
+    const nodes: any[] = json.nodes ?? [];
+    const world = new Map<number, number[]>();
+    const visit = (nodeIndex: number, parentWorld: number[]): void => {
+        const node = nodes[nodeIndex];
+        if (!node) {
+            return;
+        }
+        const local = node.matrix ?? mat4FromTRS(node);
+        const worldMatrix = mat4Multiply(parentWorld, local);
+        world.set(nodeIndex, worldMatrix);
+        for (const child of node.children ?? []) {
+            visit(child, worldMatrix);
+        }
+    };
+    const roots: number[] = json.scenes?.[json.scene ?? 0]?.nodes ?? [];
+    for (const root of roots) {
+        visit(root, mat4Identity());
+    }
+    return world;
+}
+
+/** Deep-walk collecting every numeric `index` field found under a material (or any nested
+ *  value within it) — see remapMaterialTextureIndices' doc comment for why this is a safe
+ *  heuristic scoped to a single material's own subtree. Used here just to find which
+ *  texture indices a needed material depends on, before the main compacting pass. */
+function collectTextureIndices(node: unknown, out: Set<number>): void {
+    if (Array.isArray(node)) {
+        for (const item of node) {
+            collectTextureIndices(item, out);
+        }
+        return;
+    }
+    if (node && typeof node === "object") {
+        for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+            if (key === "index" && typeof value === "number") {
+                out.add(value);
+            } else {
+                collectTextureIndices(value, out);
+            }
+        }
+    }
+}
+
+/** Merge only specific meshes from `source` into `base` — e.g. just a pair of organ
+ *  meshes rather than an entire duplicate body — instead of mergeGltfContainers' whole-file
+ *  merge. This computes each selected mesh instance's *world* matrix within `source`'s own
+ *  scene hierarchy and adds it to `base` as a single new top-level node (no parent chain
+ *  carried over), so it lands in the same place it occupied in `source`'s own scene.
+ *  Only the accessors/bufferViews/materials/textures/images/samplers actually used by the
+ *  selected meshes are copied — unlike the whole-file merge, this does NOT bring in any
+ *  of `source`'s other geometry, so merging in e.g. two small organ meshes stays cheap
+ *  even when `source` itself is a huge full-body model.
+ *
+ *  Limitations: skins and morph targets on the selected meshes are not supported (their
+ *  accessors/vertex data would need the whole skeleton/joint hierarchy to make sense) —
+ *  pick a non-skinned, non-animated mesh, or use mergeGltfContainers for the whole file
+ *  instead. Node-level extensions (e.g. KHR_lights_punctual) on the selected mesh's own
+ *  node, and animations targeting it, are also not carried over. */
+export function mergeSelectedMeshesIntoContainer(base: ParsedGltfContainer, source: ParsedGltfContainer, selectedMeshIndices: number[], sourceLabel = "model B"): ParsedGltfContainer {
+    if (selectedMeshIndices.length === 0) {
+        throw new Error("Select at least one mesh to merge in.");
+    }
+    const baseBytes = getSingleBufferBytes(base, "current model");
+    const sourceBytes = getSingleBufferBytes(source, sourceLabel);
+    const baseJson = base.json;
+    const sourceJson = source.json;
+
+    const selectedSet = new Set(selectedMeshIndices);
+    const worldMatrices = computeWorldMatrices(sourceJson);
+    const sourceNodes: any[] = sourceJson.nodes ?? [];
+    const sourceMeshes: any[] = sourceJson.meshes ?? [];
+    const sourceAccessors: any[] = sourceJson.accessors ?? [];
+    const sourceBufferViews: any[] = sourceJson.bufferViews ?? [];
+    const sourceMaterials: any[] = sourceJson.materials ?? [];
+    const sourceTextures: any[] = sourceJson.textures ?? [];
+    const sourceImages: any[] = sourceJson.images ?? [];
+    const sourceSamplers: any[] = sourceJson.samplers ?? [];
+
+    const matches: { nodeIndex: number; meshIndex: number; worldMatrix: number[] }[] = [];
+    sourceNodes.forEach((node, nodeIndex) => {
+        if (node?.mesh !== undefined && selectedSet.has(node.mesh)) {
+            if (node.skin !== undefined) {
+                throw new Error(`"${node.name ?? `node ${nodeIndex}`}" is a skinned mesh (rigged to a skeleton), so it can't be merged in by itself — uncheck it, or merge in that model's skeleton too.`);
+            }
+            matches.push({ nodeIndex, meshIndex: node.mesh, worldMatrix: worldMatrices.get(nodeIndex) ?? mat4Identity() });
+        }
+    });
+    if (matches.length === 0) {
+        throw new Error("None of the selected meshes are placed in this file's scene.");
+    }
+
+    const neededMeshIndices = Array.from(new Set(matches.map((m) => m.meshIndex)));
+    const neededAccessorIndices = new Set<number>();
+    const neededMaterialIndices = new Set<number>();
+    for (const meshIndex of neededMeshIndices) {
+        for (const prim of sourceMeshes[meshIndex]?.primitives ?? []) {
+            if (prim.targets?.length) {
+                throw new Error(`"${sourceMeshes[meshIndex].name ?? `mesh ${meshIndex}`}" has morph targets (shape-key animation), which aren't supported when merging in individual meshes — uncheck it to continue.`);
+            }
+            for (const accIdx of Object.values(prim.attributes ?? {}) as number[]) {
+                neededAccessorIndices.add(accIdx);
+            }
+            if (prim.indices !== undefined) {
+                neededAccessorIndices.add(prim.indices);
+            }
+            if (prim.material !== undefined) {
+                neededMaterialIndices.add(prim.material);
+            }
+        }
+    }
+
+    const neededBufferViewIndices = new Set<number>();
+    for (const accIdx of neededAccessorIndices) {
+        const acc = sourceAccessors[accIdx];
+        if (acc?.bufferView !== undefined) {
+            neededBufferViewIndices.add(acc.bufferView);
+        }
+        if (acc?.sparse) {
+            neededBufferViewIndices.add(acc.sparse.indices.bufferView);
+            neededBufferViewIndices.add(acc.sparse.values.bufferView);
+        }
+    }
+
+    const neededTextureIndices = new Set<number>();
+    for (const matIdx of neededMaterialIndices) {
+        collectTextureIndices(sourceMaterials[matIdx], neededTextureIndices);
+    }
+
+    const neededSamplerIndices = new Set<number>();
+    const neededImageIndices = new Set<number>();
+    for (const texIdx of neededTextureIndices) {
+        const tex = sourceTextures[texIdx];
+        if (tex?.sampler !== undefined) {
+            neededSamplerIndices.add(tex.sampler);
+        }
+        if (tex?.source !== undefined) {
+            neededImageIndices.add(tex.source);
+        }
+        const basisuSource = tex?.extensions?.KHR_texture_basisu?.source;
+        if (basisuSource !== undefined) {
+            neededImageIndices.add(basisuSource);
+        }
+    }
+    for (const imgIdx of neededImageIndices) {
+        const bv = sourceImages[imgIdx]?.bufferView;
+        if (bv !== undefined) {
+            neededBufferViewIndices.add(bv);
+        }
+    }
+
+    // --- Pack only the needed bufferView byte ranges, each kept at the same 4-byte
+    // alignment remainder it had in `source`'s own buffer, so every accessor that reads
+    // from it stays correctly aligned even though it's now at a different absolute offset. ---
+    const bufferViewIndexBase = (baseJson.bufferViews ?? []).length;
+    const bufferViewOldToNew = new Map<number, number>();
+    const newBufferViews: any[] = [];
+    const appendedChunks: Uint8Array[] = [];
+    const paddedBaseLength = padTo4(baseBytes.length);
+    let cursor = 0;
+    for (const oldIdx of Array.from(neededBufferViewIndices).sort((x, y) => x - y)) {
+        const bv = sourceBufferViews[oldIdx];
+        const oldByteOffset = bv.byteOffset ?? 0;
+        const targetRemainder = oldByteOffset % 4;
+        const pad = (targetRemainder - (cursor % 4) + 4) % 4;
+        if (pad > 0) {
+            appendedChunks.push(new Uint8Array(pad));
+            cursor += pad;
+        }
+        const newByteOffset = paddedBaseLength + cursor;
+        appendedChunks.push(sourceBytes.slice(oldByteOffset, oldByteOffset + bv.byteLength));
+        cursor += bv.byteLength;
+        bufferViewOldToNew.set(oldIdx, bufferViewIndexBase + newBufferViews.length);
+        newBufferViews.push({ ...bv, buffer: 0, byteOffset: newByteOffset });
+    }
+    const combinedBin = new Uint8Array(paddedBaseLength + cursor);
+    combinedBin.set(baseBytes, 0);
+    {
+        let writeOffset = paddedBaseLength;
+        for (const chunk of appendedChunks) {
+            combinedBin.set(chunk, writeOffset);
+            writeOffset += chunk.length;
+        }
+    }
+
+    const accessorIndexBase = (baseJson.accessors ?? []).length;
+    const accessorOldToNew = new Map<number, number>();
+    const newAccessors: any[] = [];
+    for (const oldIdx of Array.from(neededAccessorIndices).sort((x, y) => x - y)) {
+        const acc = { ...sourceAccessors[oldIdx] };
+        if (acc.bufferView !== undefined) {
+            acc.bufferView = bufferViewOldToNew.get(acc.bufferView)!;
+        }
+        if (acc.sparse) {
+            acc.sparse = {
+                ...acc.sparse,
+                indices: { ...acc.sparse.indices, bufferView: bufferViewOldToNew.get(acc.sparse.indices.bufferView)! },
+                values: { ...acc.sparse.values, bufferView: bufferViewOldToNew.get(acc.sparse.values.bufferView)! },
+            };
+        }
+        accessorOldToNew.set(oldIdx, accessorIndexBase + newAccessors.length);
+        newAccessors.push(acc);
+    }
+
+    const imageIndexBase = (baseJson.images ?? []).length;
+    const imageOldToNew = new Map<number, number>();
+    const newImages: any[] = [];
+    for (const oldIdx of Array.from(neededImageIndices).sort((x, y) => x - y)) {
+        const img = { ...sourceImages[oldIdx] };
+        if (img.bufferView !== undefined) {
+            img.bufferView = bufferViewOldToNew.get(img.bufferView)!;
+        }
+        imageOldToNew.set(oldIdx, imageIndexBase + newImages.length);
+        newImages.push(img);
+    }
+
+    const samplerIndexBase = (baseJson.samplers ?? []).length;
+    const samplerOldToNew = new Map<number, number>();
+    const newSamplers: any[] = [];
+    for (const oldIdx of Array.from(neededSamplerIndices).sort((x, y) => x - y)) {
+        samplerOldToNew.set(oldIdx, samplerIndexBase + newSamplers.length);
+        newSamplers.push(sourceSamplers[oldIdx]);
+    }
+
+    const textureIndexBase = (baseJson.textures ?? []).length;
+    const textureOldToNew = new Map<number, number>();
+    const newTextures: any[] = [];
+    for (const oldIdx of Array.from(neededTextureIndices).sort((x, y) => x - y)) {
+        const tex = { ...sourceTextures[oldIdx] };
+        if (tex.sampler !== undefined) {
+            tex.sampler = samplerOldToNew.get(tex.sampler)!;
+        }
+        if (tex.source !== undefined) {
+            tex.source = imageOldToNew.get(tex.source)!;
+        }
+        if (tex.extensions?.KHR_texture_basisu?.source !== undefined) {
+            tex.extensions = { ...tex.extensions, KHR_texture_basisu: { ...tex.extensions.KHR_texture_basisu, source: imageOldToNew.get(tex.extensions.KHR_texture_basisu.source)! } };
+        }
+        textureOldToNew.set(oldIdx, textureIndexBase + newTextures.length);
+        newTextures.push(tex);
+    }
+
+    const remapMaterialTextureIndicesViaMap = (node: unknown): any => {
+        if (Array.isArray(node)) {
+            return node.map(remapMaterialTextureIndicesViaMap);
+        }
+        if (node && typeof node === "object") {
+            const out: Record<string, unknown> = {};
+            for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+                out[key] = remapMaterialTextureIndicesViaMap(value);
+            }
+            if (typeof out.index === "number") {
+                out.index = textureOldToNew.get(out.index as number)!;
+            }
+            return out;
+        }
+        return node;
+    };
+    const materialIndexBase = (baseJson.materials ?? []).length;
+    const materialOldToNew = new Map<number, number>();
+    const newMaterials: any[] = [];
+    for (const oldIdx of Array.from(neededMaterialIndices).sort((x, y) => x - y)) {
+        materialOldToNew.set(oldIdx, materialIndexBase + newMaterials.length);
+        newMaterials.push(remapMaterialTextureIndicesViaMap(sourceMaterials[oldIdx]));
+    }
+
+    const meshIndexBase = (baseJson.meshes ?? []).length;
+    const meshOldToNew = new Map<number, number>();
+    const newMeshes: any[] = [];
+    for (const meshIndex of neededMeshIndices) {
+        const mesh = sourceMeshes[meshIndex];
+        const newPrimitives = (mesh.primitives ?? []).map((prim: any) => {
+            const out: any = { ...prim, attributes: Object.fromEntries(Object.entries(prim.attributes ?? {}).map(([k, v]) => [k, accessorOldToNew.get(v as number)!])) };
+            if (out.indices !== undefined) {
+                out.indices = accessorOldToNew.get(out.indices)!;
+            }
+            if (out.material !== undefined) {
+                out.material = materialOldToNew.get(out.material)!;
+            }
+            return out;
+        });
+        meshOldToNew.set(meshIndex, meshIndexBase + newMeshes.length);
+        newMeshes.push({ ...mesh, primitives: newPrimitives });
+    }
+
+    const nodeIndexBase = (baseJson.nodes ?? []).length;
+    const newNodes = matches.map(({ nodeIndex, meshIndex, worldMatrix }) => {
+        const baseName = sourceNodes[nodeIndex]?.name ?? sourceMeshes[meshIndex]?.name ?? `mesh ${meshIndex}`;
+        return { name: `${sourceLabel}: ${baseName}`, mesh: meshOldToNew.get(meshIndex)!, matrix: worldMatrix };
+    });
+    const newNodeIndices = newNodes.map((_, i) => nodeIndexBase + i);
+
+    const mergedJson: any = {
+        ...baseJson,
+        buffers: [{ byteLength: combinedBin.length }],
+        bufferViews: [...(baseJson.bufferViews ?? []), ...newBufferViews],
+        accessors: [...(baseJson.accessors ?? []), ...newAccessors],
+        images: [...(baseJson.images ?? []), ...newImages],
+        samplers: [...(baseJson.samplers ?? []), ...newSamplers],
+        textures: [...(baseJson.textures ?? []), ...newTextures],
+        materials: [...(baseJson.materials ?? []), ...newMaterials],
+        meshes: [...(baseJson.meshes ?? []), ...newMeshes],
+        nodes: [...(baseJson.nodes ?? []), ...newNodes],
+    };
+    const sceneIndex = mergedJson.scene ?? 0;
+    mergedJson.scenes = (mergedJson.scenes ?? []).map((scene: any, i: number) => (i === sceneIndex ? { ...scene, nodes: [...(scene.nodes ?? []), ...newNodeIndices] } : scene));
+    mergedJson.scene = sceneIndex;
+
+    // A new resource is only safe to introduce silently via extensionsUsed (harmless if
+    // over-declared); extensionsRequired is stricter, so only carry forward entries that
+    // are demonstrably present in the newly added subtree.
+    const newSubtreeText = JSON.stringify({ newMaterials, newTextures, newImages });
+    const usedExtensions = new Set<string>(baseJson.extensionsUsed ?? []);
+    for (const ext of sourceJson.extensionsUsed ?? []) {
+        if (newSubtreeText.includes(ext)) {
+            usedExtensions.add(ext);
+        }
+    }
+    const requiredExtensions = new Set<string>(baseJson.extensionsRequired ?? []);
+    for (const ext of sourceJson.extensionsRequired ?? []) {
+        if (newSubtreeText.includes(ext)) {
+            requiredExtensions.add(ext);
+        }
+    }
+    if (usedExtensions.size > 0) {
+        mergedJson.extensionsUsed = Array.from(usedExtensions);
+    } else {
+        delete mergedJson.extensionsUsed;
+    }
+    if (requiredExtensions.size > 0) {
+        mergedJson.extensionsRequired = Array.from(requiredExtensions);
+    } else {
+        delete mergedJson.extensionsRequired;
+    }
+
+    return { json: mergedJson, binChunk: combinedBin, isBinary: true };
+}

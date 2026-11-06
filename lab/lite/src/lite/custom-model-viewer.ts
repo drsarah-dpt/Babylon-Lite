@@ -46,7 +46,7 @@ import {
 } from "./gltf-container-io.js";
 import { createAnnotationOverlay, parseStoredAnnotations } from "./annotation-overlay.js";
 import { loadSheetsConfig, saveSheetsConfig, connect as connectSheets, isConnected as isSheetsConnected } from "./google-sheets.js";
-import { mergeGltfContainers } from "./merge-gltf.js";
+import { mergeSelectedMeshesIntoContainer, listSelectableMeshes } from "./merge-gltf.js";
 
 const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
 const dropZone = document.getElementById("drop-zone")!;
@@ -58,6 +58,11 @@ const showAllButton = document.getElementById("show-all-button") as HTMLButtonEl
 const exportButton = document.getElementById("export-button") as HTMLButtonElement;
 const mergeButton = document.getElementById("merge-button") as HTMLButtonElement;
 const mergeFileInput = document.getElementById("merge-file-input") as HTMLInputElement;
+const mergeSelectPanel = document.getElementById("merge-select-panel")!;
+const mergeSelectHint = document.getElementById("merge-select-hint")!;
+const mergeSelectList = document.getElementById("merge-select-list")!;
+const mergeSelectConfirm = document.getElementById("merge-select-confirm") as HTMLButtonElement;
+const mergeSelectCancel = document.getElementById("merge-select-cancel") as HTMLButtonElement;
 const annotationsPanel = document.getElementById("annotations-panel")!;
 const annotationsList = document.getElementById("annotations-list")!;
 const annotationPinLayer = document.getElementById("annotation-pins")!;
@@ -604,33 +609,83 @@ async function loadModel(file: File): Promise<void> {
     }
 }
 
-/** Merge a newly-picked file into the currently loaded model, producing one combined
- *  model with a single unified mesh list (every mesh from either file gets its own
- *  on/off toggle in the Layers panel, and Export produces one combined .glb). Pending
- *  deletions/renames/opacity/color edits already made on the current model are baked
- *  into its JSON first (the same "apply deletions before serializing" step used by
- *  exportModel), so they aren't lost in the merge. */
-async function mergeModel(file: File): Promise<void> {
+/** State for the "pick which meshes to merge in" panel — set when a merge file has been
+ *  parsed and is awaiting the user's mesh selection, cleared on confirm/cancel. */
+let pendingMergeParsed: ParsedGltfContainer | null = null;
+let pendingMergeFileName: string | null = null;
+
+/** Parse a newly-picked merge file and show the mesh-selection panel, rather than
+ *  merging the whole file in blindly — a full-body source model can be far heavier
+ *  than the handful of meshes actually needed (e.g. just a pair of organ meshes), so
+ *  letting the user pick exactly which meshes to bring in keeps the merge cheap and
+ *  avoids pulling in a duplicate skeleton/muscle set. */
+async function openMergeSelectionPanel(file: File): Promise<void> {
     if (!loadedContainer) {
-        setStatus("Load a model first, then use \"Merge in another model\" to combine a second one in.", true);
+        setStatus("Load a model first, then use \"+ Merge In Another Model\" to combine a second one in.", true);
         return;
     }
-    setStatus(`Merging in "${file.name}"…`);
+    setStatus(`Reading "${file.name}"…`);
+    try {
+        const data = await file.arrayBuffer();
+        const parsed = parseGltfContainer(data);
+        const entries = listSelectableMeshes(parsed);
+        if (entries.length === 0) {
+            setStatus(`"${file.name}" has no meshes placed in its scene to merge in.`, true);
+            return;
+        }
+        pendingMergeParsed = parsed;
+        pendingMergeFileName = file.name;
+        mergeSelectHint.textContent = `From "${file.name}" — only the meshes you check are merged in, so you can bring in just the parts you need (e.g. a pair of organ meshes) without the rest of the file.`;
+        mergeSelectList.replaceChildren();
+        for (const entry of entries) {
+            const row = document.createElement("label");
+            row.className = "merge-select-row";
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.dataset.meshIndex = String(entry.meshIndex);
+            const nameSpan = document.createElement("span");
+            nameSpan.textContent = entry.name;
+            row.append(checkbox, nameSpan);
+            if (entry.instanceCount > 1) {
+                const countSpan = document.createElement("span");
+                countSpan.className = "instance-count";
+                countSpan.textContent = `×${entry.instanceCount}`;
+                row.appendChild(countSpan);
+            }
+            mergeSelectList.appendChild(row);
+        }
+        mergeSelectPanel.classList.remove("hidden");
+        setStatus(`Choose which meshes from "${file.name}" to merge in, then click "Merge Selected".`);
+    } catch (err) {
+        setStatus(`Failed to read "${file.name}": ${(err as Error).message}`, true);
+        console.error(err);
+    }
+}
+
+/** Merge only the checked meshes from the pending merge file into the currently loaded
+ *  model. Pending deletions/renames/opacity/color edits already made on the current
+ *  model are baked into its JSON first (the same "apply deletions before serializing"
+ *  step used by exportModel), so they aren't lost in the merge. */
+async function mergeSelectedMeshes(selectedMeshIndices: number[]): Promise<void> {
+    if (!loadedContainer || !pendingMergeParsed || !pendingMergeFileName) {
+        return;
+    }
+    const parsedB = pendingMergeParsed;
+    const sourceFileName = pendingMergeFileName;
+    pendingMergeParsed = null;
+    pendingMergeFileName = null;
+    setStatus(`Merging ${selectedMeshIndices.length} mesh(es) from "${sourceFileName}"…`);
     try {
         applyPrimitiveDeletions(loadedContainer.json, deletedPrimitiveKeys);
         deletedPrimitiveKeys = new Set();
 
-        const data = await file.arrayBuffer();
-        const parsedB = parseGltfContainer(data);
-        const merged = mergeGltfContainers(loadedContainer, parsedB, originalFileName, file.name);
+        const sourceLabel = sourceFileName.replace(/\.(glb|gltf)$/i, "");
+        const merged = mergeSelectedMeshesIntoContainer(loadedContainer, parsedB, selectedMeshIndices, sourceLabel);
         const blob = serializeGlb(merged.json, merged.binChunk ?? new Uint8Array(0));
         const mergedBuffer = await blob.arrayBuffer();
-
-        const baseA = originalFileName.replace(/\.(glb|gltf)$/i, "");
-        const baseB = file.name.replace(/\.(glb|gltf)$/i, "");
-        await loadModelFromBuffer(mergedBuffer, `${baseA}+${baseB}-merged.glb`);
+        await loadModelFromBuffer(mergedBuffer, originalFileName);
     } catch (err) {
-        setStatus(`Failed to merge "${file.name}": ${(err as Error).message}`, true);
+        setStatus(`Failed to merge: ${(err as Error).message}`, true);
         console.error(err);
     }
 }
@@ -665,10 +720,27 @@ fileInput.addEventListener("change", () => {
 mergeButton.addEventListener("click", () => mergeFileInput.click());
 mergeFileInput.addEventListener("change", () => {
     const file = mergeFileInput.files?.[0];
-    if (file) {
-        void mergeModel(file);
-    }
     mergeFileInput.value = "";
+    if (file) {
+        void openMergeSelectionPanel(file);
+    }
+});
+mergeSelectConfirm.addEventListener("click", () => {
+    const selected = [...mergeSelectList.querySelectorAll("input[type=checkbox]")]
+        .filter((cb) => (cb as HTMLInputElement).checked)
+        .map((cb) => Number((cb as HTMLInputElement).dataset.meshIndex));
+    if (selected.length === 0) {
+        setStatus("Select at least one mesh to merge in.", true);
+        return;
+    }
+    mergeSelectPanel.classList.add("hidden");
+    void mergeSelectedMeshes(selected);
+});
+mergeSelectCancel.addEventListener("click", () => {
+    mergeSelectPanel.classList.add("hidden");
+    pendingMergeParsed = null;
+    pendingMergeFileName = null;
+    setStatus("Merge cancelled.");
 });
 
 // Mark the loader overlay ready immediately — there is no model to wait for until the user picks one.

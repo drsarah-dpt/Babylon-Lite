@@ -102,6 +102,28 @@
     #merge-button:hover:not(:disabled) { background: #388bfd; }
     #merge-button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
 
+    #merge-select-panel {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 20;
+      width: min(90vw, 360px); max-height: 70vh; overflow-y: auto;
+      padding: 1rem 1.1rem; border-radius: 10px;
+      background: rgba(13, 17, 23, 0.97); border: 1px solid #30363d;
+      color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #merge-select-panel.hidden { display: none; }
+    #merge-select-panel h3 { font-size: 0.85rem; margin: 0 0 0.25rem; }
+    #merge-select-hint { font-size: 0.72rem; color: #8b949e; margin-bottom: 0.6rem; }
+    .merge-select-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.2rem 0; font-size: 0.8rem; }
+    .merge-select-row span.instance-count { color: #8b949e; font-size: 0.7rem; }
+    #merge-select-actions { display: flex; gap: 0.5rem; margin-top: 0.7rem; }
+    #merge-select-actions button {
+      flex: 1; padding: 0.4rem 0.5rem; border: none; border-radius: 6px;
+      font-size: 0.8rem; font-weight: 600; cursor: pointer;
+    }
+    #merge-select-confirm { background: #238636; color: #fff; }
+    #merge-select-confirm:hover { background: #2ea043; }
+    #merge-select-cancel { background: #30363d; color: #e6edf3; }
+    #merge-select-cancel:hover { background: #484f58; }
+
     #annotations-panel {
       position: fixed; bottom: 1rem; right: 1rem; z-index: 10;
       width: 260px; max-height: 40vh; overflow-y: auto;
@@ -227,6 +249,15 @@
     <button id="merge-button" disabled title="Combine another .glb/.gltf file into this model as one exportable model">+ Merge In Another Model</button>
     <input id="merge-file-input" type="file" accept=".glb,.gltf" style="display:none" />
     <button id="export-button" disabled title="Download the model with renamed layers and annotations baked in">Export Renamed Model</button>
+  </div>
+  <div id="merge-select-panel" class="hidden">
+    <h3>Select meshes to merge in</h3>
+    <div id="merge-select-hint"></div>
+    <div id="merge-select-list"></div>
+    <div id="merge-select-actions">
+      <button id="merge-select-confirm">Merge Selected</button>
+      <button id="merge-select-cancel">Cancel</button>
+    </div>
   </div>
   <div id="annotations-panel" class="hidden">
     <h3>Annotations</h3>
