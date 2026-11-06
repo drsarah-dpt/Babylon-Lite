@@ -124,6 +124,45 @@
     #merge-select-cancel { background: #30363d; color: #e6edf3; }
     #merge-select-cancel:hover { background: #484f58; }
 
+    #align-groups-panel {
+      position: fixed; top: 7rem; left: 1rem; z-index: 15;
+      width: min(80vw, 280px); max-height: 30vh; overflow-y: auto;
+      padding: 0.6rem 0.8rem; border-radius: 10px;
+      background: rgba(13, 17, 23, 0.9); border: 1px solid #30363d;
+      color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #align-groups-panel.hidden { display: none; }
+    #align-groups-panel h3 { font-size: 0.78rem; margin: 0 0 0.4rem; color: #8b949e; font-weight: 600; }
+    .align-group-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.25rem 0; font-size: 0.78rem; }
+    .align-group-row button {
+      padding: 0.25rem 0.55rem; border: none; border-radius: 6px; background: #1f6feb;
+      color: #fff; font-size: 0.72rem; font-weight: 600; cursor: pointer;
+    }
+    .align-group-row button:hover { background: #388bfd; }
+    .align-group-row button.active { background: #2ea043; }
+
+    #align-toolbar {
+      position: fixed; bottom: 1rem; left: 1rem; z-index: 15;
+      display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;
+      max-width: min(45vw, 260px);
+      padding: 0.5rem 0.7rem; border-radius: 10px;
+      background: rgba(13, 17, 23, 0.95); border: 1px solid #30363d;
+      color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 0.78rem;
+    }
+    #align-toolbar.hidden { display: none; }
+    #align-toolbar-label { margin-right: 0.3rem; color: #8b949e; }
+    #align-toolbar button {
+      padding: 0.35rem 0.6rem; border: none; border-radius: 6px; background: #30363d;
+      color: #e6edf3; font-size: 0.75rem; font-weight: 600; cursor: pointer;
+    }
+    #align-toolbar button:hover { background: #484f58; }
+    #align-toolbar button.active { background: #1f6feb; }
+    #align-toolbar-reset { background: #8b572a !important; }
+    #align-toolbar-reset:hover { background: #a86a33 !important; }
+    #align-toolbar-done { background: #238636 !important; }
+    #align-toolbar-done:hover { background: #2ea043 !important; }
+
     #annotations-panel {
       position: fixed; bottom: 1rem; right: 1rem; z-index: 10;
       width: 260px; max-height: 40vh; overflow-y: auto;
@@ -258,6 +297,18 @@
       <button id="merge-select-confirm">Merge Selected</button>
       <button id="merge-select-cancel">Cancel</button>
     </div>
+  </div>
+  <div id="align-groups-panel" class="hidden">
+    <h3>Merged Models — align placement</h3>
+    <div id="align-groups-list"></div>
+  </div>
+  <div id="align-toolbar" class="hidden">
+    <span id="align-toolbar-label"></span>
+    <button id="align-mode-move" class="active" title="Move the merged group">Move</button>
+    <button id="align-mode-rotate" title="Rotate the merged group">Rotate</button>
+    <button id="align-mode-scale" title="Scale the merged group">Scale</button>
+    <button id="align-toolbar-reset" title="Undo this alignment adjustment">Reset</button>
+    <button id="align-toolbar-done" title="Keep this placement">Done</button>
   </div>
   <div id="annotations-panel" class="hidden">
     <h3>Annotations</h3>

@@ -25,12 +25,31 @@ import {
     getViewProjectionMatrix,
     createPickingRay,
     pickMeshesWithRayPrecise,
+    createUtilityLayer,
+    registerUtilityLayer,
+    disposeUtilityLayer,
+    createPositionGizmo,
+    attachPositionGizmoToNode,
+    disposePositionGizmo,
+    createRotationGizmo,
+    attachRotationGizmoToNode,
+    disposeRotationGizmo,
+    createScaleGizmo,
+    attachScaleGizmoToNode,
+    disposeScaleGizmo,
+    createTransformNode,
+    setParent,
     type EngineContext,
     type SceneContext,
     type Mesh,
     type Camera,
     type PbrMaterialProps,
     type StandardMaterialProps,
+    type SceneNode,
+    type UtilityLayer,
+    type PositionGizmo,
+    type RotationGizmo,
+    type ScaleGizmo,
 } from "babylon-lite";
 import {
     parseGltfContainer,
@@ -63,6 +82,15 @@ const mergeSelectHint = document.getElementById("merge-select-hint")!;
 const mergeSelectList = document.getElementById("merge-select-list")!;
 const mergeSelectConfirm = document.getElementById("merge-select-confirm") as HTMLButtonElement;
 const mergeSelectCancel = document.getElementById("merge-select-cancel") as HTMLButtonElement;
+const alignGroupsPanel = document.getElementById("align-groups-panel")!;
+const alignGroupsList = document.getElementById("align-groups-list")!;
+const alignToolbar = document.getElementById("align-toolbar")!;
+const alignToolbarLabel = document.getElementById("align-toolbar-label")!;
+const alignModeMoveButton = document.getElementById("align-mode-move") as HTMLButtonElement;
+const alignModeRotateButton = document.getElementById("align-mode-rotate") as HTMLButtonElement;
+const alignModeScaleButton = document.getElementById("align-mode-scale") as HTMLButtonElement;
+const alignResetButton = document.getElementById("align-toolbar-reset") as HTMLButtonElement;
+const alignDoneButton = document.getElementById("align-toolbar-done") as HTMLButtonElement;
 const annotationsPanel = document.getElementById("annotations-panel")!;
 const annotationsList = document.getElementById("annotations-list")!;
 const annotationPinLayer = document.getElementById("annotation-pins")!;
@@ -105,6 +133,38 @@ let selectedRow: HTMLDivElement | null = null;
 /** Custom extras key annotations are stored under in the glTF JSON, namespaced to avoid
  *  colliding with other tools' `extras` usage. */
 const ANNOTATIONS_EXTRAS_KEY = "babylonLiteAnnotations";
+
+/** One "Merge Selected" click's set of newly-added top-level glTF nodes, grouped so they
+ *  can be moved/rotated/scaled together as a rigid unit via the Align toolbar. `nodes` are
+ *  the live SceneNode objects (one per merged top-level node — a mesh.parent, not the Mesh
+ *  itself; see mergeSelectedMeshes()). `nodeIndices` are the matching glTF node indices in
+ *  `loadedContainer.json.nodes`, so commitAlignment() can bake the final placement back
+ *  into the export JSON. */
+interface MergeGroup {
+    id: number;
+    label: string;
+    nodeIndices: number[];
+    nodes: SceneNode[];
+}
+let nextAlignGroupId = 1;
+let mergeGroups: MergeGroup[] = [];
+let activeAlignGroup: MergeGroup | null = null;
+
+/** The scene's synthetic root TransformNode (container.entities[0] from the glTF loader —
+ *  see load-gltf.ts's buildNodeHierarchy), used as the reparent target both for each
+ *  align-group's wrapper node and for un-wrapping on commit. Reset on every new load. */
+let sceneRootNode: SceneNode | null = null;
+/** The wrapper TransformNode a MergeGroup's nodes are temporarily reparented under while
+ *  aligning — see startAligning()/commitAlignment(). */
+let alignWrapper: SceneNode | null = null;
+let alignUtilityLayer: UtilityLayer | null = null;
+let alignPositionGizmo: PositionGizmo | null = null;
+let alignRotationGizmo: RotationGizmo | null = null;
+let alignScaleGizmo: ScaleGizmo | null = null;
+type AlignMode = "move" | "rotate" | "scale";
+let alignMode: AlignMode = "move";
+
+
 
 const annotationOverlay = createAnnotationOverlay({
     canvas,
@@ -552,8 +612,10 @@ const enginePromise: Promise<EngineContext> = createEngine(canvas);
  *  file bytes that have already been decided on (a plain loaded file, or the
  *  re-serialized result of a merge), parses them, and rebuilds the whole scene +
  *  Layers panel from scratch. `displayName` is only used for status messages and as
- *  the export file name. */
-async function loadModelFromBuffer(data: ArrayBuffer, displayName: string): Promise<void> {
+ *  the export file name. `mergeInfo`, when present, means this reload followed a
+ *  "Merge Selected" click — it's used to locate the newly-added nodes and
+ *  immediately start an alignment session for them (see startAligning()). */
+async function loadModelFromBuffer(data: ArrayBuffer, displayName: string, mergeInfo?: { nodeIndices: number[]; primitiveCounts: number[]; label: string }): Promise<void> {
     const parsed = parseGltfContainer(data);
     loadedContainer = parsed;
     originalFileName = displayName;
@@ -572,6 +634,18 @@ async function loadModelFromBuffer(data: ArrayBuffer, displayName: string): Prom
         disposeScene(activeScene);
         activeScene = null;
     }
+    // Tear down any gizmo/utility-layer state from the previous load — the whole
+    // scene (and every SceneNode in it, including any align wrapper) is being
+    // discarded, so an in-progress-but-uncommitted alignment is simply lost along
+    // with it (same as any other unsaved viewport edit on a reload).
+    disposeAlignGizmos();
+    mergeGroups = [];
+    activeAlignGroup = null;
+    alignWrapper = null;
+    sceneRootNode = null;
+    alignGroupsPanel.classList.add("hidden");
+    alignGroupsList.replaceChildren();
+    alignToolbar.classList.add("hidden");
 
     const scene = createSceneContext(engine);
     const container = await loadGltf(engine, data);
@@ -583,6 +657,14 @@ async function loadModelFromBuffer(data: ArrayBuffer, displayName: string): Prom
     activeCamera = cam;
 
     await registerScene(scene);
+
+    sceneRootNode = (container.entities[0] as SceneNode) ?? null;
+    alignUtilityLayer = createUtilityLayer(engine, scene);
+    alignPositionGizmo = createPositionGizmo(engine, alignUtilityLayer);
+    alignRotationGizmo = createRotationGizmo(engine, alignUtilityLayer);
+    alignScaleGizmo = createScaleGizmo(engine, alignUtilityLayer);
+    await registerUtilityLayer(alignUtilityLayer);
+
     await startEngine(engine);
     activeScene = scene;
 
@@ -596,7 +678,191 @@ async function loadModelFromBuffer(data: ArrayBuffer, displayName: string): Prom
     dropZone.classList.add("hidden");
     setStatus(`Loaded "${displayName}". Drop another file to replace it.`);
     dropZone.classList.remove("hidden");
+
+    if (mergeInfo && mergeInfo.nodeIndices.length > 0) {
+        const total = mergeInfo.primitiveCounts.reduce((a, b) => a + b, 0);
+        const tail = pickableMeshes.slice(pickableMeshes.length - total);
+        const nodes: SceneNode[] = [];
+        let cursor = 0;
+        for (const count of mergeInfo.primitiveCounts) {
+            const firstMeshOfNode = tail[cursor];
+            if (firstMeshOfNode?.parent) {
+                nodes.push(firstMeshOfNode.parent as SceneNode);
+            }
+            cursor += count;
+        }
+        if (nodes.length === mergeInfo.nodeIndices.length) {
+            const group: MergeGroup = { id: nextAlignGroupId++, label: mergeInfo.label, nodeIndices: mergeInfo.nodeIndices, nodes };
+            mergeGroups.push(group);
+            renderAlignGroupsPanel();
+            startAligning(group);
+            setStatus(`Merged ${nodes.length} mesh group(s) from "${mergeInfo.label}" — drag the gizmo to align them, then click Done.`);
+        }
+    }
 }
+
+// ─── Merged-mesh alignment ──────────────────────────────────────────────
+// After a selective merge, the newly-added meshes land at their SOURCE file's own
+// world placement (see mergeSelectedMeshesIntoContainer) — which only lines up with
+// the base model when both files share a common origin/scale/orientation. When they
+// don't, the user needs to manually move/rotate/scale the merged group into place.
+// We do this by temporarily reparenting the merged group's nodes under a throwaway
+// wrapper TransformNode (preserving their current world position — no visual jump),
+// attaching a Move/Rotate/Scale gizmo to the WRAPPER so the whole group drags as one
+// rigid unit, then on "Done" reparenting each node back out from under the wrapper —
+// which bakes the adjustment into each node's local matrix — and writing that matrix
+// into the export JSON.
+
+function disposeAlignGizmos(): void {
+    if (alignUtilityLayer) {
+        if (alignPositionGizmo) {
+            disposePositionGizmo(alignPositionGizmo, alignUtilityLayer);
+        }
+        if (alignRotationGizmo) {
+            disposeRotationGizmo(alignRotationGizmo, alignUtilityLayer);
+        }
+        if (alignScaleGizmo) {
+            disposeScaleGizmo(alignScaleGizmo, alignUtilityLayer);
+        }
+        disposeUtilityLayer(alignUtilityLayer);
+    }
+    alignUtilityLayer = null;
+    alignPositionGizmo = null;
+    alignRotationGizmo = null;
+    alignScaleGizmo = null;
+}
+
+/** Attach the gizmo for the current alignMode to `node` (or detach all three when
+ *  `node` is null), so only one gizmo is ever visible/draggable at a time. */
+function applyAlignGizmoAttachment(node: SceneNode | null): void {
+    if (alignPositionGizmo) {
+        attachPositionGizmoToNode(alignPositionGizmo, node && alignMode === "move" ? node : null);
+    }
+    if (alignRotationGizmo) {
+        attachRotationGizmoToNode(alignRotationGizmo, node && alignMode === "rotate" ? node : null);
+    }
+    if (alignScaleGizmo) {
+        attachScaleGizmoToNode(alignScaleGizmo, node && alignMode === "scale" ? node : null);
+    }
+}
+
+function setAlignMode(mode: AlignMode): void {
+    alignMode = mode;
+    applyAlignGizmoAttachment(alignWrapper);
+    for (const [button, m] of [
+        [alignModeMoveButton, "move"],
+        [alignModeRotateButton, "rotate"],
+        [alignModeScaleButton, "scale"],
+    ] as const) {
+        button.classList.toggle("active", m === mode);
+    }
+}
+
+/** Begin (or resume) an alignment session for `group`: wraps its nodes in a fresh
+ *  TransformNode and attaches the current-mode gizmo to that wrapper. Auto-commits
+ *  any other group that's mid-alignment first, so only one group is ever being
+ *  edited at once. */
+function startAligning(group: MergeGroup): void {
+    if (activeAlignGroup && activeAlignGroup !== group) {
+        commitAlignment(activeAlignGroup);
+    }
+    if (activeAlignGroup === group && alignWrapper) {
+        alignToolbar.classList.remove("hidden");
+        renderAlignGroupsPanel();
+        return;
+    }
+    if (!sceneRootNode) {
+        return;
+    }
+    const wrapper = createTransformNode(`align-wrapper-${group.id}`);
+    setParent(wrapper, sceneRootNode);
+    for (const node of group.nodes) {
+        setParent(node, wrapper);
+    }
+    alignWrapper = wrapper;
+    activeAlignGroup = group;
+    alignMode = "move";
+    applyAlignGizmoAttachment(wrapper);
+    alignToolbarLabel.textContent = group.label;
+    alignModeMoveButton.classList.add("active");
+    alignModeRotateButton.classList.remove("active");
+    alignModeScaleButton.classList.remove("active");
+    alignToolbar.classList.remove("hidden");
+    renderAlignGroupsPanel();
+}
+
+/** Undo the current wrapper adjustment (move/rotate/scale back to identity), without
+ *  ending the alignment session — the group stays wrapped and gizmo-editable. */
+function resetAlignment(): void {
+    if (!alignWrapper) {
+        return;
+    }
+    alignWrapper.position.set(0, 0, 0);
+    alignWrapper.rotationQuaternion.set(0, 0, 0, 1);
+    alignWrapper.scaling.set(1, 1, 1);
+}
+
+/** Bake the group's current wrapper-adjusted world placement back into each node's
+ *  local matrix (relative to the scene root, matching glTF's top-level-node
+ *  convention) and write it into the export JSON, then discard the wrapper. */
+function commitAlignment(group: MergeGroup): void {
+    if (activeAlignGroup !== group || !alignWrapper || !sceneRootNode || !loadedContainer) {
+        return;
+    }
+    const nodes = loadedContainer.json.nodes ?? [];
+    for (let i = 0; i < group.nodes.length; i++) {
+        const node = group.nodes[i]!;
+        const nodeIndex = group.nodeIndices[i]!;
+        setParent(node, sceneRootNode);
+        const localMatrix = node._localMatrix;
+        const jsonNode = nodes[nodeIndex];
+        if (localMatrix && jsonNode) {
+            jsonNode.matrix = Array.from({ length: 16 }, (_, k) => localMatrix[k]);
+            delete jsonNode.translation;
+            delete jsonNode.rotation;
+            delete jsonNode.scale;
+        }
+    }
+    setParent(alignWrapper, null);
+    applyAlignGizmoAttachment(null);
+    alignWrapper = null;
+    activeAlignGroup = null;
+    alignToolbar.classList.add("hidden");
+    renderAlignGroupsPanel();
+}
+
+function renderAlignGroupsPanel(): void {
+    if (mergeGroups.length === 0) {
+        alignGroupsPanel.classList.add("hidden");
+        alignGroupsList.replaceChildren();
+        return;
+    }
+    alignGroupsPanel.classList.remove("hidden");
+    alignGroupsList.replaceChildren();
+    for (const group of mergeGroups) {
+        const row = document.createElement("div");
+        row.className = "align-group-row";
+        const label = document.createElement("span");
+        label.textContent = `${group.label} (${group.nodes.length} mesh${group.nodes.length === 1 ? "" : "es"})`;
+        const button = document.createElement("button");
+        const isActive = activeAlignGroup === group;
+        button.textContent = isActive ? "Aligning…" : "Align";
+        button.classList.toggle("active", isActive);
+        button.addEventListener("click", () => startAligning(group));
+        row.append(label, button);
+        alignGroupsList.appendChild(row);
+    }
+}
+
+alignModeMoveButton.addEventListener("click", () => setAlignMode("move"));
+alignModeRotateButton.addEventListener("click", () => setAlignMode("rotate"));
+alignModeScaleButton.addEventListener("click", () => setAlignMode("scale"));
+alignResetButton.addEventListener("click", resetAlignment);
+alignDoneButton.addEventListener("click", () => {
+    if (activeAlignGroup) {
+        commitAlignment(activeAlignGroup);
+    }
+});
 
 async function loadModel(file: File): Promise<void> {
     setStatus(`Loading "${file.name}"…`);
@@ -680,10 +946,26 @@ async function mergeSelectedMeshes(selectedMeshIndices: number[]): Promise<void>
         deletedPrimitiveKeys = new Set();
 
         const sourceLabel = sourceFileName.replace(/\.(glb|gltf)$/i, "");
+        // Count primitives per newly-merged top-level node (one source node can carry a
+        // multi-primitive mesh) BEFORE merging, in the same source-node-array order the
+        // merge itself uses — this lets us slice the exact tail of the reloaded
+        // pickableMeshes array back into per-node groups for the alignment feature,
+        // without needing any node-index map from the loader (see custom-model-viewer.ts
+        // top-of-file comment on MergeGroup).
+        const selectedSet = new Set(selectedMeshIndices);
+        const sourceNodes = parsedB.json.nodes ?? [];
+        const sourceMeshes = parsedB.json.meshes ?? [];
+        const primitiveCounts: number[] = [];
+        for (const node of sourceNodes) {
+            if (node?.mesh !== undefined && selectedSet.has(node.mesh)) {
+                primitiveCounts.push(sourceMeshes[node.mesh]?.primitives?.length ?? 1);
+            }
+        }
+
         const merged = mergeSelectedMeshesIntoContainer(loadedContainer, parsedB, selectedMeshIndices, sourceLabel);
-        const blob = serializeGlb(merged.json, merged.binChunk ?? new Uint8Array(0));
+        const blob = serializeGlb(merged.container.json, merged.container.binChunk ?? new Uint8Array(0));
         const mergedBuffer = await blob.arrayBuffer();
-        await loadModelFromBuffer(mergedBuffer, originalFileName);
+        await loadModelFromBuffer(mergedBuffer, originalFileName, { nodeIndices: merged.newNodeIndices, primitiveCounts, label: sourceLabel });
     } catch (err) {
         setStatus(`Failed to merge: ${(err as Error).message}`, true);
         console.error(err);

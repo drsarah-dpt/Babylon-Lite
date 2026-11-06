@@ -421,6 +421,15 @@ function collectTextureIndices(node: unknown, out: Set<number>): void {
     }
 }
 
+/** Result of {@link mergeSelectedMeshesIntoContainer} — the merged container plus the
+ *  glTF node index of each newly-added top-level node (in the same order the matched
+ *  meshes were found), so a caller can later re-locate and adjust each merged mesh's
+ *  placement (see the "align merged meshes" flow in custom-model-viewer.ts). */
+export interface SelectedMeshMergeResult {
+    container: ParsedGltfContainer;
+    newNodeIndices: number[];
+}
+
 /** Merge only specific meshes from `source` into `base` — e.g. just a pair of organ
  *  meshes rather than an entire duplicate body — instead of mergeGltfContainers' whole-file
  *  merge. This computes each selected mesh instance's *world* matrix within `source`'s own
@@ -436,7 +445,7 @@ function collectTextureIndices(node: unknown, out: Set<number>): void {
  *  pick a non-skinned, non-animated mesh, or use mergeGltfContainers for the whole file
  *  instead. Node-level extensions (e.g. KHR_lights_punctual) on the selected mesh's own
  *  node, and animations targeting it, are also not carried over. */
-export function mergeSelectedMeshesIntoContainer(base: ParsedGltfContainer, source: ParsedGltfContainer, selectedMeshIndices: number[], sourceLabel = "model B"): ParsedGltfContainer {
+export function mergeSelectedMeshesIntoContainer(base: ParsedGltfContainer, source: ParsedGltfContainer, selectedMeshIndices: number[], sourceLabel = "model B"): SelectedMeshMergeResult {
     if (selectedMeshIndices.length === 0) {
         throw new Error("Select at least one mesh to merge in.");
     }
@@ -712,5 +721,5 @@ export function mergeSelectedMeshesIntoContainer(base: ParsedGltfContainer, sour
         delete mergedJson.extensionsRequired;
     }
 
-    return { json: mergedJson, binChunk: combinedBin, isBinary: true };
+    return { container: { json: mergedJson, binChunk: combinedBin, isBinary: true }, newNodeIndices };
 }
