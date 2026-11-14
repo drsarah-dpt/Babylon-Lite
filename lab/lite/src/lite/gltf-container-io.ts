@@ -44,10 +44,14 @@ export function parseGltfContainer(data: ArrayBuffer): ParsedGltfContainer {
 }
 
 /** One flattened babylon-lite Mesh's glTF origin: which `meshes[]` entry and which
- *  primitive within it produced it. */
+ *  primitive within it produced it, plus the `nodes[]` entry that placed it in the
+ *  scene (the node babylon-lite's Mesh is parented to) — used by the "combine meshes
+ *  within this model" feature to find the live SceneNode for a Layers-panel row and to
+ *  update that node's own glTF JSON entry. */
 export interface MeshPrimitiveRef {
     meshIndex: number;
     primitiveIndex: number;
+    nodeIndex: number;
 }
 
 /** DFS over the glTF node hierarchy, mirroring babylon-lite's internal
@@ -72,7 +76,7 @@ export function collectMeshIndicesInContainerOrder(json: any): MeshPrimitiveRef[
         if (node.mesh !== undefined) {
             const primCount = meshes[node.mesh]?.primitives?.length ?? 1;
             for (let p = 0; p < primCount; p++) {
-                refs.push({ meshIndex: node.mesh, primitiveIndex: p });
+                refs.push({ meshIndex: node.mesh, primitiveIndex: p, nodeIndex: nodeIdx });
             }
         }
     };

@@ -82,6 +82,12 @@ const mergeSelectHint = document.getElementById("merge-select-hint")!;
 const mergeSelectList = document.getElementById("merge-select-list")!;
 const mergeSelectConfirm = document.getElementById("merge-select-confirm") as HTMLButtonElement;
 const mergeSelectCancel = document.getElementById("merge-select-cancel") as HTMLButtonElement;
+const combineButton = document.getElementById("combine-button") as HTMLButtonElement;
+const combineSelectPanel = document.getElementById("combine-select-panel")!;
+const combineSelectName = document.getElementById("combine-select-name") as HTMLInputElement;
+const combineSelectList = document.getElementById("combine-select-list")!;
+const combineSelectConfirm = document.getElementById("combine-select-confirm") as HTMLButtonElement;
+const combineSelectCancel = document.getElementById("combine-select-cancel") as HTMLButtonElement;
 const alignGroupsPanel = document.getElementById("align-groups-panel")!;
 const alignGroupsList = document.getElementById("align-groups-list")!;
 const alignToolbar = document.getElementById("align-toolbar")!;
@@ -149,6 +155,28 @@ interface MergeGroup {
 let nextAlignGroupId = 1;
 let mergeGroups: MergeGroup[] = [];
 let activeAlignGroup: MergeGroup | null = null;
+
+/** A "Combine Meshes" group: several meshes already in the currently loaded model,
+ *  gathered under one new wrapper glTF node so the Layers panel can show them as a
+ *  single row with one on/off toggle (see combineSelectedNodes()/renderLayerGroupRow()).
+ *  Unlike MergeGroup (which only groups newly merged-in nodes for alignment), this
+ *  group is permanent — it's written into loadedContainer.json's node hierarchy so it
+ *  survives Export. `memberNodeIndices` are the ORIGINAL glTF node indices of the
+ *  meshes that were combined (unchanged — only their parent changed); `wrapperNodeIndex`
+ *  is the new node's own index. */
+interface CombinedGroup {
+    id: number;
+    label: string;
+    wrapperNodeIndex: number;
+    memberNodeIndices: number[];
+}
+let nextCombinedGroupId = 1;
+let combinedGroups: CombinedGroup[] = [];
+
+/** The glTF node-index refs for the Layers panel rows currently on screen (parallel to
+ *  `pickableMeshes`), kept at module scope so combineSelectedNodes()/ungroupCombinedGroup()
+ *  can re-render the Layers panel after editing loadedContainer.json without a full reload. */
+let currentMeshRefs: MeshPrimitiveRef[] = [];
 
 /** The scene's synthetic root TransformNode (container.entities[0] from the glTF loader —
  *  see load-gltf.ts's buildNodeHierarchy), used as the reparent target both for each
@@ -343,13 +371,28 @@ function buildLayersPanel(meshes: Mesh[], meshRefs: MeshPrimitiveRef[]): void {
     layersList.replaceChildren();
     showAllButton.classList.add("hidden");
     pickableMeshes = meshes;
+    currentMeshRefs = meshRefs;
     meshRowMap = new Map();
     selectedRow = null;
     if (meshes.length === 0) {
         layersPanel.classList.add("hidden");
+        combineButton.disabled = true;
         return;
     }
     layersPanel.classList.remove("hidden");
+    combineButton.disabled = meshes.length < 2;
+
+    // Rows whose mesh belongs to a CombinedGroup are routed into that group's
+    // collapsible body (see appendLayerGroupRow()) instead of straight into
+    // layersList — built once up front so the per-mesh loop below can look each
+    // mesh's group up by its glTF node index in O(1).
+    const nodeIndexToGroup = new Map<number, CombinedGroup>();
+    for (const group of combinedGroups) {
+        for (const idx of group.memberNodeIndices) {
+            nodeIndexToGroup.set(idx, group);
+        }
+    }
+    const groupContainers = new Map<number, { bodyDiv: HTMLDivElement; checkbox: HTMLInputElement; members: { mesh: Mesh; checkbox: HTMLInputElement }[] }>();
 
     // One entry per row, filled in below as rows are built, so the isolate/show-all
     // wiring (added after the loop) can see every row's mesh/checkbox/elements at once.
@@ -517,8 +560,97 @@ function buildLayersPanel(meshes: Mesh[], meshRefs: MeshPrimitiveRef[]): void {
 
         entries.push({ mesh, checkbox, row, locateButton });
         meshRowMap.set(mesh, row);
-        layersList.appendChild(row);
+
+        const group = ref ? nodeIndexToGroup.get(ref.nodeIndex) : undefined;
+        if (group) {
+            let container = groupContainers.get(group.id);
+            if (!container) {
+                container = appendLayerGroupRow(group);
+                groupContainers.set(group.id, container);
+            }
+            checkbox.classList.add("layer-group-member-checkbox");
+            container.members.push({ mesh, checkbox });
+            container.bodyDiv.appendChild(row);
+        } else {
+            layersList.appendChild(row);
+        }
     });
+
+    // Reconcile each group's header checkbox now that every member row exists —
+    // checked only when every member in the group is currently visible.
+    for (const container of groupContainers.values()) {
+        container.checkbox.checked = container.members.every((m) => m.checkbox.checked);
+    }
+}
+
+/** Create and append a CombinedGroup's header row (single on/off toggle + rename +
+ *  expand/collapse + ungroup) plus its collapsible member-row body, returning the live
+ *  handles buildLayersPanel()'s per-mesh loop needs to route that group's own rows into
+ *  the body and keep the header checkbox in sync. */
+function appendLayerGroupRow(group: CombinedGroup): { bodyDiv: HTMLDivElement; checkbox: HTMLInputElement; members: { mesh: Mesh; checkbox: HTMLInputElement }[] } {
+    const wrapperDiv = document.createElement("div");
+    wrapperDiv.className = "layer-group";
+
+    const header = document.createElement("div");
+    header.className = "layer-group-header";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = true;
+    checkbox.title = "Toggle every mesh in this group on/off together";
+
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "layer-group-name";
+    nameInput.value = group.label;
+    nameInput.title = "Click to rename this group";
+    const commitGroupRename = () => {
+        const trimmed = nameInput.value.trim();
+        const finalName = trimmed || group.label;
+        group.label = finalName;
+        nameInput.value = finalName;
+        const jsonNode = loadedContainer?.json.nodes?.[group.wrapperNodeIndex];
+        if (jsonNode) {
+            jsonNode.name = finalName;
+        }
+    };
+    nameInput.addEventListener("change", commitGroupRename);
+    nameInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+            nameInput.blur();
+        }
+    });
+
+    const toggleButton = document.createElement("button");
+    toggleButton.type = "button";
+    toggleButton.className = "layer-group-toggle";
+    toggleButton.textContent = "▾";
+    toggleButton.title = "Expand/collapse this group's individual meshes (to adjust their own color/opacity)";
+
+    const ungroupButton = document.createElement("button");
+    ungroupButton.type = "button";
+    ungroupButton.className = "layer-group-ungroup";
+    ungroupButton.textContent = "✕";
+    ungroupButton.title = "Ungroup — restore each mesh's own on/off toggle";
+    ungroupButton.addEventListener("click", () => ungroupCombinedGroup(group));
+
+    header.append(checkbox, nameInput, toggleButton, ungroupButton);
+
+    const bodyDiv = document.createElement("div");
+    bodyDiv.className = "layer-group-body hidden";
+    toggleButton.addEventListener("click", () => bodyDiv.classList.toggle("hidden"));
+
+    const groupContainer = { bodyDiv, checkbox, members: [] as { mesh: Mesh; checkbox: HTMLInputElement }[] };
+    checkbox.addEventListener("change", () => {
+        for (const member of groupContainer.members) {
+            member.checkbox.checked = checkbox.checked;
+            setMeshVisible(member.mesh, checkbox.checked);
+        }
+    });
+
+    wrapperDiv.append(header, bodyDiv);
+    layersList.appendChild(wrapperDiv);
+    return groupContainer;
 }
 
 /** Highlight the Layers panel row for `mesh` (clearing any previous highlight) and
@@ -640,6 +772,7 @@ async function loadModelFromBuffer(data: ArrayBuffer, displayName: string, merge
     // with it (same as any other unsaved viewport edit on a reload).
     disposeAlignGizmos();
     mergeGroups = [];
+    combinedGroups = [];
     activeAlignGroup = null;
     alignWrapper = null;
     sceneRootNode = null;
@@ -700,6 +833,182 @@ async function loadModelFromBuffer(data: ArrayBuffer, displayName: string, merge
         }
     }
 }
+
+// ─── Combine meshes within the current model ────────────────────────────
+// Unlike "+ Merge In Another Model" (which brings meshes IN from a second file), this
+// groups meshes that are ALREADY in the currently loaded model under one new wrapper
+// node so the Layers panel shows them as a single row with one on/off toggle — e.g.
+// collapsing several small vein/nerve/lymphatic meshes into one "Vasculature" toggle,
+// while still letting each keep its own color/opacity (expand the group to reach them).
+// The grouping is written directly into loadedContainer.json so it's preserved by
+// Export; it does NOT touch any vertex/geometry data (see the ask_user choice this
+// feature was built from — "keep separate colors, just group under one toggle").
+
+/** Drop `nodeIndex` from wherever it's referenced as a child in `json` — the default
+ *  scene's root node list, or any other node's `children` array — so it can be safely
+ *  re-parented elsewhere without leaving a dangling duplicate reference. */
+function removeNodeReference(json: any, nodeIndex: number): void {
+    const sceneIndex = json.scene ?? 0;
+    json.scenes = (json.scenes ?? []).map((scene: any, i: number) =>
+        i === sceneIndex ? { ...scene, nodes: (scene.nodes ?? []).filter((n: number) => n !== nodeIndex) } : scene);
+    for (const node of json.nodes ?? []) {
+        if (node?.children) {
+            node.children = node.children.filter((n: number) => n !== nodeIndex);
+        }
+    }
+}
+
+/** Find the live SceneNode currently hosting the mesh placed by glTF node `nodeIndex`,
+ *  by looking up a Layers-panel row whose ref matches it (see MeshPrimitiveRef). */
+function findLiveNodeForJsonNode(nodeIndex: number): SceneNode | undefined {
+    const i = currentMeshRefs.findIndex((r) => r.nodeIndex === nodeIndex);
+    const mesh = i >= 0 ? pickableMeshes[i] : undefined;
+    return mesh?.parent as SceneNode | undefined;
+}
+
+/** Combine the meshes placed by `nodeIndices` (their CURRENT glTF node indices — these
+ *  don't change, only their parent does) into one new wrapper node named `label`. Each
+ *  node is reparented under a fresh permanent TransformNode, preserving its current
+ *  world position/rotation/scale exactly like the Align toolbar's wrapper-and-bake
+ *  pattern (see commitAlignment()) — then the glTF JSON is restructured to match: a new
+ *  `{ name, children: nodeIndices }` node replaces them as a scene root. */
+function combineSelectedNodes(nodeIndices: number[], label: string): void {
+    if (!loadedContainer || !sceneRootNode) {
+        setStatus("Load a model first.", true);
+        return;
+    }
+    const json = loadedContainer.json;
+    const nodes: any[] = json.nodes ?? [];
+
+    const liveNodes: SceneNode[] = [];
+    for (const nodeIndex of nodeIndices) {
+        const liveNode = findLiveNodeForJsonNode(nodeIndex);
+        if (!liveNode) {
+            setStatus(`Couldn't find a mesh for node ${nodeIndex} to combine — try reloading the model.`, true);
+            return;
+        }
+        liveNodes.push(liveNode);
+    }
+
+    const wrapper = createTransformNode(label);
+    setParent(wrapper, sceneRootNode);
+    liveNodes.forEach((node, i) => {
+        setParent(node, wrapper);
+        const localMatrix = node._localMatrix;
+        const jsonNode = nodes[nodeIndices[i]!];
+        if (localMatrix && jsonNode) {
+            jsonNode.matrix = Array.from({ length: 16 }, (_, k) => localMatrix[k]);
+            delete jsonNode.translation;
+            delete jsonNode.rotation;
+            delete jsonNode.scale;
+        }
+    });
+
+    for (const nodeIndex of nodeIndices) {
+        removeNodeReference(json, nodeIndex);
+    }
+    const wrapperNodeIndex = nodes.length;
+    nodes.push({ name: label, children: [...nodeIndices] });
+    json.nodes = nodes;
+    const sceneIndex = json.scene ?? 0;
+    json.scenes = (json.scenes ?? []).map((scene: any, i: number) =>
+        i === sceneIndex ? { ...scene, nodes: [...(scene.nodes ?? []), wrapperNodeIndex] } : scene);
+
+    combinedGroups.push({ id: nextCombinedGroupId++, label, wrapperNodeIndex, memberNodeIndices: [...nodeIndices] });
+    setStatus(`Combined ${nodeIndices.length} meshes into "${label}" — toggle them together from the Layers panel, or expand the group to adjust each one's color.`);
+    buildLayersPanel(pickableMeshes, currentMeshRefs);
+}
+
+/** Undo a combine: reparent each member node back under the scene root (preserving its
+ *  current world transform, baked into the export JSON the same way combineSelectedNodes
+ *  bakes it in), then drop the now-childless wrapper node from the scene so each mesh
+ *  gets its own Layers panel row and toggle back. The wrapper's glTF node entry is left
+ *  in place but unreferenced (harmless — exporters/viewers only walk nodes reachable from
+ *  a scene root) rather than spliced out, so no other stored node index needs remapping. */
+function ungroupCombinedGroup(group: CombinedGroup): void {
+    if (!loadedContainer || !sceneRootNode) {
+        return;
+    }
+    const json = loadedContainer.json;
+    const nodes: any[] = json.nodes ?? [];
+
+    for (const nodeIndex of group.memberNodeIndices) {
+        const liveNode = findLiveNodeForJsonNode(nodeIndex);
+        if (!liveNode) {
+            continue;
+        }
+        setParent(liveNode, sceneRootNode);
+        const localMatrix = liveNode._localMatrix;
+        const jsonNode = nodes[nodeIndex];
+        if (localMatrix && jsonNode) {
+            jsonNode.matrix = Array.from({ length: 16 }, (_, k) => localMatrix[k]);
+            delete jsonNode.translation;
+            delete jsonNode.rotation;
+            delete jsonNode.scale;
+        }
+    }
+
+    removeNodeReference(json, group.wrapperNodeIndex);
+    const wrapperJsonNode = nodes[group.wrapperNodeIndex];
+    if (wrapperJsonNode) {
+        wrapperJsonNode.children = [];
+    }
+    const sceneIndex = json.scene ?? 0;
+    json.scenes = (json.scenes ?? []).map((scene: any, i: number) =>
+        i === sceneIndex ? { ...scene, nodes: [...(scene.nodes ?? []), ...group.memberNodeIndices] } : scene);
+
+    combinedGroups = combinedGroups.filter((g) => g.id !== group.id);
+    setStatus(`Ungrouped "${group.label}" — each mesh has its own toggle again.`);
+    buildLayersPanel(pickableMeshes, currentMeshRefs);
+}
+
+/** Show the "pick meshes to combine" panel, listing one row per distinct glTF node
+ *  currently placing a mesh in the scene (deduplicated so a multi-primitive mesh's
+ *  several Layers-panel rows don't produce duplicate entries here — see
+ *  collectMeshIndicesInContainerOrder's doc comment). Meshes already in a combined
+ *  group are left out — ungroup first if you want to regroup one differently. */
+function openCombineSelectionPanel(): void {
+    if (!loadedContainer || pickableMeshes.length < 2) {
+        setStatus("Load a model with at least two meshes to combine.", true);
+        return;
+    }
+    const groupedNodeIndices = new Set(combinedGroups.flatMap((g) => g.memberNodeIndices));
+    const seen = new Set<number>();
+    combineSelectList.replaceChildren();
+    pickableMeshes.forEach((mesh, i) => {
+        const nodeIndex = currentMeshRefs[i]?.nodeIndex;
+        if (nodeIndex === undefined || seen.has(nodeIndex) || groupedNodeIndices.has(nodeIndex)) {
+            return;
+        }
+        seen.add(nodeIndex);
+        const row = document.createElement("label");
+        row.className = "merge-select-row";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.dataset.nodeIndex = String(nodeIndex);
+        const nameSpan = document.createElement("span");
+        nameSpan.textContent = mesh.name || `mesh ${i}`;
+        row.append(checkbox, nameSpan);
+        combineSelectList.appendChild(row);
+    });
+    combineSelectName.value = "";
+    combineSelectPanel.classList.remove("hidden");
+    setStatus('Choose at least two meshes to combine into one group, give it a name, then click "Combine".');
+}
+combineButton.addEventListener("click", openCombineSelectionPanel);
+combineSelectConfirm.addEventListener("click", () => {
+    const selectedNodeIndices = [...combineSelectList.querySelectorAll("input[type=checkbox]")]
+        .filter((cb) => (cb as HTMLInputElement).checked)
+        .map((cb) => Number((cb as HTMLInputElement).dataset.nodeIndex));
+    if (selectedNodeIndices.length < 2) {
+        setStatus("Select at least two meshes to combine.", true);
+        return;
+    }
+    const label = combineSelectName.value.trim() || `Combined (${selectedNodeIndices.length} meshes)`;
+    combineSelectPanel.classList.add("hidden");
+    combineSelectedNodes(selectedNodeIndices, label);
+});
+combineSelectCancel.addEventListener("click", () => combineSelectPanel.classList.add("hidden"));
 
 // ─── Merged-mesh alignment ──────────────────────────────────────────────
 // After a selective merge, the newly-added meshes land at their SOURCE file's own
